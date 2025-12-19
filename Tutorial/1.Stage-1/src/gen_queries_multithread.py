@@ -3,7 +3,8 @@ import json
 from openai import OpenAI
 from textwrap import dedent
 from dotenv import load_dotenv
-from tqdm import tqdm  # ← 新增导入
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
@@ -14,6 +15,7 @@ load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 INPUT_FILE = os.path.join(PROJECT_ROOT, "data", "opensearch_product_data.jsonl")
 OUTPUT_FILE = os.path.join(PROJECT_ROOT, "output", "generated_questions.jsonl")
 MODEL_NAME = "qwen3-max"
+MAX_WORKERS = 10  # ← 控制并发线程数，可根据 API 限流调整（如 DashScope 限流请调低）
 
 # 初始化 DashScope 兼容 OpenAI 的客户端
 client = OpenAI(
@@ -47,7 +49,12 @@ SYSTEM_PROMPT = dedent("""
         - 每条问题独立成一行，不加编号或引号。
 """).strip()
 
-def generate_questions_for_product(product: dict) -> list[str]:
+
+def generate_questions_for_product(product: dict) -> dict:
+    """
+    返回完整的输出记录：{ "skuid": "...", "questions": [...] }
+    """
+    skuid = product["skuid"]
     info = {
         "品类": product.get("category", ""),
         "商品名": product.get("product_name", ""),
@@ -79,14 +86,17 @@ def generate_questions_for_product(product: dict) -> list[str]:
         lines = [line.strip() for line in raw.split('\n') if line.strip()]
         while len(lines) < 5:
             lines.append("")
-        return lines[:5]
+        questions = lines[:5]
     except Exception as e:
-        print(f"❌ Error for skuid={product.get('skuid')}: {e}")
-        return ["", "", "", "", ""]
+        print(f"❌ Error for skuid={skuid}: {e}")
+        questions = ["", "", "", "", ""]
 
-# ======================
-# 主逻辑：严格输出 { "skuid": "...", "questions": [...] }
-# ======================
+    return {
+        "skuid": skuid,
+        "questions": questions
+    }
+
+
 def main():
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
 
@@ -105,22 +115,34 @@ def main():
                 continue
 
     total = len(valid_products)
-    print(f"🎯 Found {total} valid products with skuid. Starting generation...")
+    print(f"🎯 Found {total} valid products with skuid. Starting generation with {MAX_WORKERS} threads...")
 
-    # 第二步：逐个处理并写入，带进度条
+    # 第二步：多线程处理
+    results = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # 提交所有任务
+        future_to_skuid = {
+            executor.submit(generate_questions_for_product, product): product["skuid"]
+            for product in valid_products
+        }
+
+        # 使用 tqdm 显示进度
+        for future in tqdm(as_completed(future_to_skuid), total=total, desc="Generating questions", unit="product"):
+            try:
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                skuid = future_to_skuid[future]
+                print(f"⚠️ Unexpected error for skuid={skuid}: {e}")
+
+    # 第三步：写入文件（保持与原始顺序无关，如需保持顺序可改用 list + index）
     with open(OUTPUT_FILE, 'w', encoding='utf-8') as fout:
-        for product in tqdm(valid_products, desc="Generating questions", unit="product"):
-            skuid = product["skuid"]
-            questions = generate_questions_for_product(product)
-
-            output_record = {
-                "skuid": skuid,
-                "questions": questions
-            }
-            fout.write(json.dumps(output_record, ensure_ascii=False) + '\n')
-            fout.flush()
+        for record in results:
+            fout.write(json.dumps(record, ensure_ascii=False) + '\n')
+        fout.flush()
 
     print(f"✅ Done! Strict format results saved to {OUTPUT_FILE}")
+
 
 if __name__ == "__main__":
     main()

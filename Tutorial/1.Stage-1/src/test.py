@@ -1,9 +1,11 @@
+
+
+
 import os
 import json
 from openai import OpenAI
 from textwrap import dedent
 from dotenv import load_dotenv
-from tqdm import tqdm  # ← 新增导入
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
@@ -48,6 +50,7 @@ SYSTEM_PROMPT = dedent("""
 """).strip()
 
 def generate_questions_for_product(product: dict) -> list[str]:
+    # 只提取对生成问题有用的字段，避免冗余干扰
     info = {
         "品类": product.get("category", ""),
         "商品名": product.get("product_name", ""),
@@ -60,6 +63,7 @@ def generate_questions_for_product(product: dict) -> list[str]:
         "卖点": product.get("features", ""),
         "尺码说明": product.get("size_info", ""),
     }
+    # 清理空值
     info = {k: v for k, v in info.items() if v}
 
     user_content = f"商品信息：{json.dumps(info, ensure_ascii=False, separators=(',', ':'))}"
@@ -77,12 +81,13 @@ def generate_questions_for_product(product: dict) -> list[str]:
         )
         raw = completion.choices[0].message.content.strip()
         lines = [line.strip() for line in raw.split('\n') if line.strip()]
+        # 严格取前5条，不足则补空字符串（或可跳过，但建议保证5条）
         while len(lines) < 5:
-            lines.append("")
+            lines.append("")  # 或根据策略重试，这里先补空
         return lines[:5]
     except Exception as e:
         print(f"❌ Error for skuid={product.get('skuid')}: {e}")
-        return ["", "", "", "", ""]
+        return ["", "", "", "", ""]  # 保证格式一致
 
 # ======================
 # 主逻辑：严格输出 { "skuid": "...", "questions": [...] }
@@ -90,29 +95,26 @@ def generate_questions_for_product(product: dict) -> list[str]:
 def main():
     os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
 
-    # 第一步：预加载所有有效商品（带 skuid）
-    valid_products = []
-    with open(INPUT_FILE, 'r', encoding='utf-8') as fin:
+    with open(INPUT_FILE, 'r', encoding='utf-8') as fin, \
+         open(OUTPUT_FILE, 'w', encoding='utf-8') as fout:
+
         for line in fin:
             line = line.strip()
             if not line:
                 continue
             try:
                 product = json.loads(line)
-                if product.get("skuid"):
-                    valid_products.append(product)
             except json.JSONDecodeError:
                 continue
 
-    total = len(valid_products)
-    print(f"🎯 Found {total} valid products with skuid. Starting generation...")
+            skuid = product.get("skuid")
+            if not skuid:
+                continue
 
-    # 第二步：逐个处理并写入，带进度条
-    with open(OUTPUT_FILE, 'w', encoding='utf-8') as fout:
-        for product in tqdm(valid_products, desc="Generating questions", unit="product"):
-            skuid = product["skuid"]
+            print(f"🔄 Processing skuid: {skuid}")
             questions = generate_questions_for_product(product)
 
+            # 严格格式：只输出 skuid + questions 列表
             output_record = {
                 "skuid": skuid,
                 "questions": questions
