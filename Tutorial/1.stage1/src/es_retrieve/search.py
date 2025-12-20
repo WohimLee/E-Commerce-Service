@@ -4,11 +4,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
+
 
 from es_client import get_es
 from embedder import get_embedder
 
+
+from dotenv import load_dotenv
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../"))
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 # 你给导购/RAG 用的字段（按需增减）
 DEFAULT_SOURCE_FIELDS = [
@@ -35,8 +40,8 @@ def _as_list(v: Any) -> List[Any]:
 def build_es_filters(filters: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Convert a simple filter dict into ES filter clauses for:
-      - bool.filter (standard retriever)
-      - knn.filter (knn retriever)
+      - bool.filter (BM25)
+      - knn.filter (kNN)
 
     Supported keys:
       - terms filters: season/scene/material/style/people_gender/age_range/color/size/brand_name_kw/group_name_kw/spuid/skuid
@@ -58,7 +63,7 @@ def build_es_filters(filters: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Lis
     term_fields = [
         "season", "scene", "material", "style", "people_gender", "age_range", "color", "size",
         "skuid", "spuid",
-        # 下面两个如果你想精确匹配品牌/品类，可用 brand_name.kw / group_name.kw
+        # 精确匹配品牌/品类（keyword 子字段）
         "brand_name.kw", "group_name.kw",
     ]
 
@@ -72,7 +77,6 @@ def build_es_filters(filters: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Lis
                 bool_filters.append(clause)
                 knn_filters.append(clause)
 
-    # Range filters helper
     def add_range(field: str):
         ops = {}
         for op in ["lte", "gte", "lt", "gt"]:
@@ -91,23 +95,16 @@ def build_es_filters(filters: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Lis
 
 
 # ----------------------------
-# Query builder
+# Query builder (NO ES-RRF)
 # ----------------------------
 
-def build_search_body(
+def build_bm25_body(
     query: str,
-    query_vector: List[float],
     filters: Dict[str, Any],
-    topn: int = 50,
-    *,
-    bm25_window: int = 200,
-    knn_k: int = 200,
-    knn_num_candidates: int = 1500,
-    rrf_rank_constant: int = 60,
-    rrf_rank_window_size: int = 200,
+    size: int,
     source_fields: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    bool_filters, knn_filters = build_es_filters(filters)
+    bool_filters, _ = build_es_filters(filters)
 
     # BM25 multi_match fields (加权可按效果再调)
     mm_fields = [
@@ -120,47 +117,110 @@ def build_search_body(
     ]
 
     body: Dict[str, Any] = {
-        "size": topn,
+        "size": size,
         "track_total_hits": False,
         "_source": source_fields or DEFAULT_SOURCE_FIELDS,
-        "retriever": {
-            "rrf": {
-                "rank_constant": rrf_rank_constant,
-                "rank_window_size": rrf_rank_window_size,
-                "retrievers": [
+        "query": {
+            "bool": {
+                "filter": bool_filters,
+                "must": [
                     {
-                        "standard": {
-                            "query": {
-                                "bool": {
-                                    "filter": bool_filters,
-                                    "must": [
-                                        {
-                                            "multi_match": {
-                                                "query": query,
-                                                "fields": mm_fields,
-                                                "type": "best_fields"
-                                            }
-                                        }
-                                    ]
-                                }
-                            }
-                        }
-                    },
-                    {
-                        "knn": {
-                            "field": "emb_text",
-                            "query_vector": query_vector,
-                            "k": knn_k,
-                            "num_candidates": knn_num_candidates,
-                            "filter": knn_filters
+                        "multi_match": {
+                            "query": query,
+                            "fields": mm_fields,
+                            "type": "best_fields",
                         }
                     }
-                ]
+                ],
             }
-        }
+        },
     }
-
     return body
+
+
+def build_knn_body(
+    query_vector: List[float],
+    filters: Dict[str, Any],
+    size: int,
+    *,
+    knn_k: int,
+    knn_num_candidates: int,
+    source_fields: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    _, knn_filters = build_es_filters(filters)
+
+    # ES 8.x：top-level knn 支持 filter
+    body: Dict[str, Any] = {
+        "size": size,
+        "track_total_hits": False,
+        "_source": source_fields or DEFAULT_SOURCE_FIELDS,
+        "knn": {
+            "field": "emb_text",
+            "query_vector": query_vector,
+            "k": knn_k,
+            "num_candidates": knn_num_candidates,
+            "filter": knn_filters,
+        },
+    }
+    return body
+
+
+# ----------------------------
+# Python-side RRF (license-free)
+# ----------------------------
+
+def rrf_fuse(
+    bm25_hits: List[Dict[str, Any]],
+    knn_hits: List[Dict[str, Any]],
+    *,
+    topn: int,
+    rank_constant: int = 60,
+) -> List[Dict[str, Any]]:
+    """
+    Reciprocal Rank Fusion:
+      score(doc) = sum_i 1 / (rank_constant + rank_i)
+    rank is 1-based in each list.
+
+    We also keep _source by taking the first seen (prefer bm25 then knn).
+    """
+    scores: Dict[str, float] = {}
+    sources: Dict[str, Dict[str, Any]] = {}
+
+    def add_list(hits: List[Dict[str, Any]]):
+        for i, h in enumerate(hits):
+            doc_id = str(h.get("_id"))
+            if not doc_id or doc_id == "None":
+                continue
+            rank = i + 1
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rank_constant + rank)
+            if doc_id not in sources:
+                sources[doc_id] = h.get("_source", {}) or {}
+
+    # prefer bm25 source
+    add_list(bm25_hits)
+    add_list(knn_hits)
+
+    ranked_ids = sorted(scores.keys(), key=lambda _id: scores[_id], reverse=True)[:topn]
+    out: List[Dict[str, Any]] = []
+    for _id in ranked_ids:
+        out.append({
+            "_id": _id,
+            "_score": scores[_id],
+            "_source": sources.get(_id, {}),
+        })
+    return out
+
+
+def _normalize_es_hits(resp: Dict[str, Any]) -> List[Dict[str, Any]]:
+    hits = resp.get("hits", {}).get("hits", []) or []
+    out: List[Dict[str, Any]] = []
+    for h in hits:
+        out.append({
+            "_id": h.get("_id"),
+            "_score": h.get("_score"),
+            "_source": h.get("_source", {}),
+        })
+    return out
 
 
 # ----------------------------
@@ -177,13 +237,15 @@ def search(
     source_fields: Optional[List[str]] = None,
     knn_k: int = 200,
     knn_num_candidates: int = 1500,
+    # 下面这俩以前是 ES-RRF 的参数，现在变成“各路召回窗口”和“Python RRF 融合常数”
     rrf_rank_window_size: int = 200,
+    rrf_rank_constant: int = 60,
 ) -> List[Dict[str, Any]]:
     """
-    Hybrid search with ES retriever.rrf:
-      - standard (BM25 multi_match)
-      - knn (dense_vector cosine) with same filters
-    Returns a list of hits (dict), each includes _source and _score.
+    Hybrid search WITHOUT ES retriever.rrf (license-free):
+      1) BM25 multi_match -> get window hits
+      2) kNN vector search -> get window hits
+      3) Python-side RRF fuse -> return topn
 
     filters: see build_es_filters()
     """
@@ -198,29 +260,40 @@ def search(
 
     query_vector = embedder.embed([query])[0]
 
-    body = build_search_body(
+    # 召回窗口：越大效果越好但更慢；默认用原来的 rrf_rank_window_size
+    window = max(int(rrf_rank_window_size), topn)
+
+    # BM25
+    bm25_body = build_bm25_body(
         query=query,
+        filters=filters,
+        size=window,
+        source_fields=source_fields,
+    )
+    bm25_resp = es.search(index=index_name, body=bm25_body)
+    bm25_hits = _normalize_es_hits(bm25_resp)
+
+    # kNN：k 需要 >= window 才能拿到足够候选
+    knn_k_eff = max(int(knn_k), window)
+    knn_body = build_knn_body(
         query_vector=query_vector,
         filters=filters,
-        topn=topn,
+        size=window,
+        knn_k=knn_k_eff,
+        knn_num_candidates=int(knn_num_candidates),
         source_fields=source_fields,
-        knn_k=knn_k,
-        knn_num_candidates=knn_num_candidates,
-        rrf_rank_window_size=rrf_rank_window_size,
     )
+    knn_resp = es.search(index=index_name, body=knn_body)
+    knn_hits = _normalize_es_hits(knn_resp)
 
-    resp = es.search(index=index_name, body=body)
-    hits = resp.get("hits", {}).get("hits", []) or []
-
-    # Normalize output a bit
-    out: List[Dict[str, Any]] = []
-    for h in hits:
-        out.append({
-            "_id": h.get("_id"),
-            "_score": h.get("_score"),
-            "_source": h.get("_source", {}),
-        })
-    return out
+    # Python-side RRF fuse
+    fused = rrf_fuse(
+        bm25_hits=bm25_hits,
+        knn_hits=knn_hits,
+        topn=topn,
+        rank_constant=int(rrf_rank_constant),
+    )
+    return fused
 
 
 # ----------------------------
@@ -257,7 +330,7 @@ def _parse_cli_filters(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Hybrid search (BM25 + vector) using ES retriever.rrf")
+    parser = argparse.ArgumentParser(description="Hybrid search (BM25 + vector) with Python-side RRF (license-free)")
     parser.add_argument("--es", default=os.getenv("ES_URL", "http://localhost:9200"), help="Elasticsearch URL")
     parser.add_argument("--index", default=os.getenv("ES_INDEX", "products_sku_v1"), help="Index name")
     parser.add_argument("--q", required=True, help="Query text")
@@ -283,9 +356,10 @@ def main():
     parser.add_argument("--sales_gte", type=int, default=None, help="sales >= X")
 
     # knobs
-    parser.add_argument("--knn_k", type=int, default=200, help="kNN k")
+    parser.add_argument("--knn_k", type=int, default=200, help="kNN k (will be max(knn_k, window))")
     parser.add_argument("--knn_num_candidates", type=int, default=1500, help="kNN num_candidates")
-    parser.add_argument("--rrf_window", type=int, default=200, help="RRF rank_window_size")
+    parser.add_argument("--window", type=int, default=200, help="Retrieve window for each channel (bm25/knn)")
+    parser.add_argument("--rrf_c", type=int, default=60, help="RRF rank_constant (Python-side)")
 
     args = parser.parse_args()
 
@@ -298,7 +372,8 @@ def main():
         index_name=args.index,
         knn_k=args.knn_k,
         knn_num_candidates=args.knn_num_candidates,
-        rrf_rank_window_size=args.rrf_window,
+        rrf_rank_window_size=args.window,
+        rrf_rank_constant=args.rrf_c,
     )
 
     print(json.dumps(hits, ensure_ascii=False, indent=2))

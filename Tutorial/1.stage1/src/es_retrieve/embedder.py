@@ -235,13 +235,14 @@ class LocalEmbedder(Embedder):
         model = self.load_model()
 
         # sentence-transformers returns numpy.ndarray when convert_to_numpy=True
-        vecs = model.encode(
-            texts,
-            batch_size=self.batch_size,
-            convert_to_numpy=True,
-            normalize_embeddings=self.normalize,
-            show_progress_bar=False,
-        )
+        # vecs = model.encode(
+        #     texts,
+        #     batch_size=self.batch_size,
+        #     convert_to_numpy=True,
+        #     normalize_embeddings=self.normalize,
+        #     show_progress_bar=False,
+        # )
+        vecs = model.encode(texts)['dense_vecs']
 
         # Ensure python lists
         vectors: List[List[float]] = [v.astype(float).tolist() for v in vecs]

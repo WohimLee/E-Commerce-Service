@@ -4,11 +4,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from dotenv import load_dotenv
+from tqdm import tqdm
 from typing import Any, Dict, List, Iterable, Tuple, Optional
+
 
 from es_client import get_es, create_index_if_not_exists, bulk_index
 from schemas import PRODUCT_MAPPING
 from embedder import get_embedder
+
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../"))
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 
 
 def read_jsonl(path: str) -> Iterable[Dict[str, Any]]:
@@ -40,10 +47,10 @@ def main():
     parser.add_argument("--index", default=os.getenv("ES_INDEX", "products_sku_v1"), help="Index name")
     parser.add_argument(
         "--input",
-        default="output/merged_products.jsonl",
+        default=os.path.join(PROJECT_ROOT, "output", "merged_products.jsonl"),
         help="Input merged jsonl (from build_dataset.py)",
     )
-    parser.add_argument("--batch_size", type=int, default=int(os.getenv("BATCH_SIZE", "500")), help="Embedding/bulk batch size")
+    parser.add_argument("--batch_size", type=int, default=8, help="Embedding/bulk batch size")
     parser.add_argument("--refresh", default="false", choices=["false", "true", "wait_for"], help="ES refresh policy after bulk")
     parser.add_argument("--recreate", action="store_true", help="Delete and recreate index (DANGEROUS)")
     parser.add_argument("--dims", type=int, default=int(os.getenv("EMBEDDER_DIMS", "1024")), help="Embedding dims (must match mapping)")
@@ -60,6 +67,9 @@ def main():
     if args.recreate:
         from es_client import delete_index
         delete_index(es, args.index, ignore_missing=True)
+    # from es_client import delete_index
+    # delete_index(es, args.index, ignore_missing=True)
+    
 
     # Create index if needed
     # Ensure mapping dims match (basic safety)
