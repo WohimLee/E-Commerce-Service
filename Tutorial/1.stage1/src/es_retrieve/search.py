@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -24,6 +25,70 @@ DEFAULT_SOURCE_FIELDS = [
     "people_gender", "age_range", "color", "size"
 ]
 
+# ----------------------------
+# ✅ Thread-safe singletons (ES + embedder)
+# ----------------------------
+
+# ES client：通常是线程安全的，按 es_url 缓存
+_ES_BY_URL: Dict[str, Any] = {}
+_ES_LOCK = threading.Lock()
+
+# Embedder：很多实现并发懒加载会出 meta tensor 竞态，必须加锁
+_EMBEDDER: Any = None
+_EMBEDDER_LOCK = threading.Lock()
+_EMBEDDER_WARMED_UP = False
+
+# 如果你的 embedder.embed 本身不是线程安全（少见，但也可能），可以打开这个锁：
+#   export EMBEDDER_SERIALIZE=1
+_EMBED_LOCK = threading.Lock()
+
+
+def _get_es_cached(es_url: str):
+    es = _ES_BY_URL.get(es_url)
+    if es is not None:
+        return es
+    with _ES_LOCK:
+        es = _ES_BY_URL.get(es_url)
+        if es is None:
+            es = get_es(es_url=es_url)
+            _ES_BY_URL[es_url] = es
+    return es
+
+
+def _get_embedder_cached():
+    """
+    保证 embedder 只初始化一次，并在锁内 warmup 一次，避免并发下 meta tensor -> to() 的竞态。
+    """
+    global _EMBEDDER, _EMBEDDER_WARMED_UP
+    if _EMBEDDER is not None and _EMBEDDER_WARMED_UP:
+        return _EMBEDDER
+
+    with _EMBEDDER_LOCK:
+        if _EMBEDDER is None:
+            _EMBEDDER = get_embedder()
+
+        # ✅ 关键：在初始化锁内做一次 embed warmup，确保模型权重已 materialize
+        # 这样并发时其他线程不会拿到“还在 meta 上的半成品模型”
+        if not _EMBEDDER_WARMED_UP:
+            try:
+                _ = _EMBEDDER.embed(["__warmup__"])
+            finally:
+                # 即便 warmup 抛错，也不要让别的线程继续并发初始化；让错误暴露出来更好
+                _EMBEDDER_WARMED_UP = True
+
+    return _EMBEDDER
+
+
+def _embed_query(embedder, query: str) -> List[float]:
+    """
+    可选串行化 embed（如果 embedder.embed 非线程安全）。
+    默认不串行化；如遇到奇怪崩溃/结果漂移，可设置环境变量 EMBEDDER_SERIALIZE=1
+    """
+    if os.getenv("EMBEDDER_SERIALIZE", "").strip() in ("1", "true", "True", "yes", "YES"):
+        with _EMBED_LOCK:
+            return embedder.embed([query])[0]
+    return embedder.embed([query])[0]
+
 
 # ----------------------------
 # Filter builder
@@ -42,28 +107,13 @@ def build_es_filters(filters: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Lis
     Convert a simple filter dict into ES filter clauses for:
       - bool.filter (BM25)
       - knn.filter (kNN)
-
-    Supported keys:
-      - terms filters: season/scene/material/style/people_gender/age_range/color/size/brand_name_kw/group_name_kw/spuid/skuid
-      - range filters: price (price_lte/price_gte/price_lt/price_gt), sales (sales_lte/...)
-
-    Examples:
-      filters = {
-        "season": ["冬季"],
-        "people_gender": ["女"],
-        "color": ["黑色", "经典黑"],
-        "price_lte": 1500,
-        "price_gte": 300
-      }
     """
     bool_filters: List[Dict[str, Any]] = []
     knn_filters: List[Dict[str, Any]] = []
 
-    # Terms-like filters (keyword fields)
     term_fields = [
         "season", "scene", "material", "style", "people_gender", "age_range", "color", "size",
         "skuid", "spuid",
-        # 精确匹配品牌/品类（keyword 子字段）
         "brand_name.kw", "group_name.kw",
     ]
 
@@ -106,7 +156,6 @@ def build_bm25_body(
 ) -> Dict[str, Any]:
     bool_filters, _ = build_es_filters(filters)
 
-    # BM25 multi_match fields (加权可按效果再调)
     mm_fields = [
         "product_name^4",
         "brand_name^2",
@@ -149,7 +198,6 @@ def build_knn_body(
 ) -> Dict[str, Any]:
     _, knn_filters = build_es_filters(filters)
 
-    # ES 8.x：top-level knn 支持 filter
     body: Dict[str, Any] = {
         "size": size,
         "track_total_hits": False,
@@ -176,13 +224,6 @@ def rrf_fuse(
     topn: int,
     rank_constant: int = 60,
 ) -> List[Dict[str, Any]]:
-    """
-    Reciprocal Rank Fusion:
-      score(doc) = sum_i 1 / (rank_constant + rank_i)
-    rank is 1-based in each list.
-
-    We also keep _source by taking the first seen (prefer bm25 then knn).
-    """
     scores: Dict[str, float] = {}
     sources: Dict[str, Dict[str, Any]] = {}
 
@@ -196,7 +237,6 @@ def rrf_fuse(
             if doc_id not in sources:
                 sources[doc_id] = h.get("_source", {}) or {}
 
-    # prefer bm25 source
     add_list(bm25_hits)
     add_list(knn_hits)
 
@@ -237,33 +277,24 @@ def search(
     source_fields: Optional[List[str]] = None,
     knn_k: int = 200,
     knn_num_candidates: int = 1500,
-    # 下面这俩以前是 ES-RRF 的参数，现在变成“各路召回窗口”和“Python RRF 融合常数”
     rrf_rank_window_size: int = 200,
     rrf_rank_constant: int = 60,
 ) -> List[Dict[str, Any]]:
-    """
-    Hybrid search WITHOUT ES retriever.rrf (license-free):
-      1) BM25 multi_match -> get window hits
-      2) kNN vector search -> get window hits
-      3) Python-side RRF fuse -> return topn
-
-    filters: see build_es_filters()
-    """
     if not query or not query.strip():
         raise ValueError("query must be non-empty")
 
     es_url = es_url or os.getenv("ES_URL", "http://localhost:9200")
     index_name = index_name or os.getenv("ES_INDEX", "products_sku_v1")
 
-    es = get_es(es_url=es_url)
-    embedder = get_embedder()
+    # ✅ 缓存 + 线程安全初始化
+    es = _get_es_cached(es_url=es_url)
+    embedder = _get_embedder_cached()
 
-    query_vector = embedder.embed([query])[0]
+    # ✅ embed（必要时可串行化：export EMBEDDER_SERIALIZE=1）
+    query_vector = _embed_query(embedder, query)
 
-    # 召回窗口：越大效果越好但更慢；默认用原来的 rrf_rank_window_size
     window = max(int(rrf_rank_window_size), topn)
 
-    # BM25
     bm25_body = build_bm25_body(
         query=query,
         filters=filters,
@@ -273,7 +304,6 @@ def search(
     bm25_resp = es.search(index=index_name, body=bm25_body)
     bm25_hits = _normalize_es_hits(bm25_resp)
 
-    # kNN：k 需要 >= window 才能拿到足够候选
     knn_k_eff = max(int(knn_k), window)
     knn_body = build_knn_body(
         query_vector=query_vector,
@@ -286,7 +316,6 @@ def search(
     knn_resp = es.search(index=index_name, body=knn_body)
     knn_hits = _normalize_es_hits(knn_resp)
 
-    # Python-side RRF fuse
     fused = rrf_fuse(
         bm25_hits=bm25_hits,
         knn_hits=knn_hits,
@@ -301,13 +330,8 @@ def search(
 # ----------------------------
 
 def _parse_cli_filters(args: argparse.Namespace) -> Dict[str, Any]:
-    """
-    Simple CLI -> filters dict.
-    You can expand this as your query parser evolves.
-    """
     f: Dict[str, Any] = {}
 
-    # multi-value terms
     if args.season: f["season"] = args.season
     if args.scene: f["scene"] = args.scene
     if args.material: f["material"] = args.material
@@ -317,11 +341,9 @@ def _parse_cli_filters(args: argparse.Namespace) -> Dict[str, Any]:
     if args.color: f["color"] = args.color
     if args.size: f["size"] = args.size
 
-    # exact brand/group via keyword subfields (in build_es_filters -> brand_name.kw / group_name.kw)
     if args.brand_kw: f["brand_name_kw"] = args.brand_kw
     if args.group_kw: f["group_name_kw"] = args.group_kw
 
-    # range
     if args.price_lte is not None: f["price_lte"] = args.price_lte
     if args.price_gte is not None: f["price_gte"] = args.price_gte
     if args.sales_gte is not None: f["sales_gte"] = args.sales_gte
@@ -336,7 +358,6 @@ def main():
     parser.add_argument("--q", required=True, help="Query text")
     parser.add_argument("--topn", type=int, default=20, help="Top N results")
 
-    # term filters (repeatable)
     parser.add_argument("--season", action="append", help="Season filter, can repeat")
     parser.add_argument("--scene", action="append", help="Scene filter, can repeat")
     parser.add_argument("--material", action="append", help="Material filter, can repeat")
@@ -346,16 +367,13 @@ def main():
     parser.add_argument("--color", action="append", help="Color filter, can repeat")
     parser.add_argument("--size", action="append", help="Size filter, can repeat")
 
-    # exact keyword brand/group
     parser.add_argument("--brand_kw", action="append", help="Exact brand_name.kw filter, can repeat")
     parser.add_argument("--group_kw", action="append", help="Exact group_name.kw filter, can repeat")
 
-    # range filters
     parser.add_argument("--price_lte", type=float, default=None, help="price <= X")
     parser.add_argument("--price_gte", type=float, default=None, help="price >= X")
     parser.add_argument("--sales_gte", type=int, default=None, help="sales >= X")
 
-    # knobs
     parser.add_argument("--knn_k", type=int, default=200, help="kNN k (will be max(knn_k, window))")
     parser.add_argument("--knn_num_candidates", type=int, default=1500, help="kNN num_candidates")
     parser.add_argument("--window", type=int, default=200, help="Retrieve window for each channel (bm25/knn)")
