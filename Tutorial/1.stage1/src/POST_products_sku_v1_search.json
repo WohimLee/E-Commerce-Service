@@ -1,0 +1,42 @@
+
+{
+  "size": 50,
+  "track_total_hits": false,
+  "query": {
+    "bool": {
+      "filter": [
+        { "terms": { "season": ["冬季"] } },
+        { "terms": { "people_gender": ["女"] } },
+        { "range": { "price": { "lte": 1500 } } }
+      ],
+      "should": [
+        {
+          "multi_match": {
+            "query": "通勤 小黑裙",
+            "fields": [
+              "product_name^4",
+              "brand_name^2",
+              "group_name^2",
+              "marketing_attributes^1.5",
+              "product_description",
+              "search_text^2"
+            ],
+            "type": "best_fields"
+          }
+        }
+      ],
+      "minimum_should_match": 1
+    }
+  },
+  "knn": {
+    "field": "emb_text",
+    "query_vector": [/* embedding */],
+    "k": 200,
+    "num_candidates": 1000,
+    "filter": [
+      { "terms": { "season": ["冬季"] } },
+      { "terms": { "people_gender": ["女"] } },
+      { "range": { "price": { "lte": 1500 } } }
+    ]
+  }
+}

@@ -1,0 +1,59 @@
+
+{
+  "settings": {
+    "index": {
+      "number_of_shards": 3,
+      "number_of_replicas": 1
+    },
+    "analysis": {
+      "analyzer": {
+        "zh": {
+          "type": "standard"
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "skuid":   { "type": "keyword" },
+      "spuid":   { "type": "keyword" },
+
+      "brand_name": {
+        "type": "text",
+        "analyzer": "zh",
+        "fields": { "kw": { "type": "keyword" } }
+      },
+      "group_name": {
+        "type": "text",
+        "analyzer": "zh",
+        "fields": { "kw": { "type": "keyword" } }
+      },
+
+      "product_name": { "type": "text", "analyzer": "zh" },
+      "marketing_attributes": { "type": "text", "analyzer": "zh" },
+      "product_description": { "type": "text", "analyzer": "zh" },
+
+      "price": { "type": "float" },
+      "sales": { "type": "integer" },
+
+      "season":        { "type": "keyword" },
+      "scene":         { "type": "keyword" },
+      "material":      { "type": "keyword" },
+      "style":         { "type": "keyword" },
+      "people_gender": { "type": "keyword" },
+      "age_range":     { "type": "keyword" },
+      "color":         { "type": "keyword" },
+      "size":          { "type": "keyword" },
+
+      "search_text": { "type": "text", "analyzer": "zh" },
+
+      "emb_text": {
+        "type": "dense_vector",
+        "dims": 1024,
+        "index": true,
+        "similarity": "cosine"
+      }
+    }
+  }
+}

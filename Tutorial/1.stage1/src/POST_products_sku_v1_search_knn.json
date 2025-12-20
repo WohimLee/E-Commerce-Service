@@ -1,0 +1,17 @@
+
+{
+  "size": 200,
+  "track_total_hits": false,
+  "_source": ["skuid"],
+  "knn": {
+    "field": "emb_text",
+    "query_vector": [/* embedding */],
+    "k": 200,
+    "num_candidates": 1500,
+    "filter": [
+      { "terms": { "season": ["冬季"] } },
+      { "terms": { "people_gender": ["女"] } },
+      { "range": { "price": { "lte": 1500 } } }
+    ]
+  }
+}
